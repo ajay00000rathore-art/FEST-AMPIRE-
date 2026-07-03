@@ -92,6 +92,7 @@ class DoubleRatchetService {
     state.nReceiving = 0;
     state.remoteDhPublicKey = remoteDhPublicKey;
 
+    // 1. Classical DH
     final dhSecret = sodium.crypto.scalarmult(
       n: state.dhKeyPair.secretKey,
       p: state.remoteDhPublicKey,
@@ -99,14 +100,14 @@ class DoubleRatchetService {
     final classicalBytes = await dhSecret.extractBytes();
     dhSecret.dispose();
 
+    // 2. PQ Decapsulation
     Uint8List pqBytes = Uint8List(0);
     if (remoteMLKEMCiphertext != null && state.localMLKEMKeyPair != null) {
+      final kem = KEM.create('ML-KEM-768')!;
       try {
-        final kem = KEM.create('ML-KEM-768')!;
         pqBytes = kem.decapsulate(remoteMLKEMCiphertext, Uint8List.fromList(state.localMLKEMKeyPair!.secretKey));
+      } finally {
         kem.dispose();
-      } catch (e) {
-        throw Exception('PQC Decapsulation failed: $e');
       }
     }
 
@@ -130,9 +131,9 @@ class DoubleRatchetService {
     final newClassicalBytes = await newDhSecret.extractBytes();
     newDhSecret.dispose();
 
-    Uint8List newPQBytes = Uint8List(0);
-
-    final newCombinedSecret = Uint8List(newClassicalBytes.length + newPQBytes.length);
+    // In this step Alice would typically generate a new PQ key and Bob would encapsulate.
+    // For now we maintain the classical structure but show where PQ fits.
+    final newCombinedSecret = Uint8List(newClassicalBytes.length);
     newCombinedSecret.setRange(0, newClassicalBytes.length, newClassicalBytes);
 
     final rootKdfResult2 = await _kdfRoot(sodium, state.rootKey, newCombinedSecret);
@@ -182,17 +183,31 @@ class DoubleRatchetService {
       key: messageKey,
     );
 
-    var header = _buildHeader(state.dhKeyPair.publicKey, state.nSending, state.pn, nonce);
+    // If we have a remote ML-KEM public key, we SHOULD encapsulate here
+    Uint8List? kemCiphertext;
+    if (state.remoteMLKEMPublicKey != null) {
+       final kem = KEM.create('ML-KEM-768')!;
+       try {
+         final result = kem.encapsulate(state.remoteMLKEMPublicKey!);
+         kemCiphertext = result.ciphertext;
+         // result.sharedSecret would be used to update the root key in the NEXT DH ratchet step
+       } finally {
+         kem.dispose();
+       }
+    }
+
+    var header = _buildHeader(state.dhKeyPair.publicKey, state.nSending, state.pn, nonce, kemCiphertext);
 
     if (state.localMLDSAKeyPair != null) {
+       final sig = Signature.create('ML-DSA-65')!;
        try {
-         final sig = Signature.create('ML-DSA-65')!;
          final signature = sig.sign(Uint8List.fromList([...header, ...ciphertext]), Uint8List.fromList(state.localMLDSAKeyPair!.secretKey));
-         sig.dispose();
          header = Uint8List.fromList([...header, ...signature]);
-       } catch (e) {
-         print('Signature failed: $e');
+       } finally {
+         sig.dispose();
        }
+    } else if (state.remoteMLDSAPublicKey != null) {
+       throw Exception('Authentication failure: Local ML-DSA key missing but remote expects signed messages');
     }
 
     messageKey.dispose();
@@ -202,17 +217,20 @@ class DoubleRatchetService {
 
   static Future<Uint8List> decrypt(RatchetState state, Uint8List ciphertextWithHeader, Uint8List ad) async {
     final sodium = await MySodiumInit.instance as SodiumSumo;
-    final header = _parseHeader(ciphertextWithHeader, state.remoteMLDSAPublicKey != null);
+    final header = _parseHeader(ciphertextWithHeader, state.remoteMLDSAPublicKey != null, true); // true for optional KEM
     final ciphertext = ciphertextWithHeader.sublist(header.totalLength);
 
-    if (state.remoteMLDSAPublicKey != null && header.signature != null) {
+    if (state.remoteMLDSAPublicKey != null) {
+      if (header.signature == null) throw Exception('Authentication failure: Missing required ML-DSA signature');
       final sig = Signature.create('ML-DSA-65')!;
-      final actualSignedData = Uint8List.fromList([...ciphertextWithHeader.sublist(0, header.headerWithoutSigLength), ...ciphertext]);
-      if (!sig.verify(actualSignedData, header.signature!, state.remoteMLDSAPublicKey!)) {
+      try {
+        final actualSignedData = Uint8List.fromList([...ciphertextWithHeader.sublist(0, header.headerWithoutSigLength), ...ciphertext]);
+        if (!sig.verify(actualSignedData, header.signature!, state.remoteMLDSAPublicKey!)) {
+          throw Exception('ML-DSA Signature verification failed');
+        }
+      } finally {
         sig.dispose();
-        throw Exception('ML-DSA Signature verification failed');
       }
-      sig.dispose();
     }
 
     final skippedKey = state.skippedMessageKeys['${header.remoteDhPublicKey}_${header.n}'];
@@ -229,7 +247,7 @@ class DoubleRatchetService {
     }
 
     if (!_compareUint8Lists(state.remoteDhPublicKey, header.remoteDhPublicKey) || state.receivingChainKey == null) {
-       await _dhRatchetStep(sodium, state, header.remoteDhPublicKey, header.pn);
+       await _dhRatchetStep(sodium, state, header.remoteDhPublicKey, header.pn, remoteMLKEMCiphertext: header.kemCiphertext);
     }
 
     await _skipMessageKeys(sodium, state, header.n);
@@ -262,7 +280,7 @@ class DoubleRatchetService {
     return b.toBytes();
   }
 
-  static Uint8List _buildHeader(Uint8List dhPk, int n, int pn, Uint8List nonce) {
+  static Uint8List _buildHeader(Uint8List dhPk, int n, int pn, Uint8List nonce, Uint8List? kemCiphertext) {
     final b = BytesBuilder();
     b.add(dhPk);
     final data = ByteData(8);
@@ -270,22 +288,41 @@ class DoubleRatchetService {
     data.setUint32(4, pn);
     b.add(data.buffer.asUint8List());
     b.add(nonce);
+    if (kemCiphertext != null) {
+       b.addByte(1); // KEM present
+       b.add(kemCiphertext);
+    } else {
+       b.addByte(0); // No KEM
+    }
     return b.toBytes();
   }
 
-  static _Header _parseHeader(Uint8List data, bool hasSignature) {
+  static _Header _parseHeader(Uint8List data, bool expectSignature, bool hasKemFlag) {
     final dhPk = data.sublist(0, 32);
     final bd = ByteData.view(data.buffer, data.offsetInBytes + 32, 8);
     final n = bd.getUint32(0);
     final pn = bd.getUint32(4);
     final nonce = data.sublist(40, 40 + 24);
     int offset = 40 + 24;
+
+    Uint8List? kemCiphertext;
+    if (hasKemFlag) {
+       final isKemPresent = data[offset] == 1;
+       offset++;
+       if (isKemPresent) {
+          // ML-KEM-768 ciphertext is 1088 bytes
+          kemCiphertext = data.sublist(offset, offset + 1088);
+          offset += 1088;
+       }
+    }
+
+    final int headerWithoutSigLength = offset;
     Uint8List? signature;
-    if (hasSignature) {
+    if (expectSignature) {
        signature = data.sublist(offset, offset + 3309);
        offset += 3309;
     }
-    return _Header(dhPk, n, pn, nonce, offset, signature, 40 + 24);
+    return _Header(dhPk, n, pn, nonce, offset, signature, headerWithoutSigLength, kemCiphertext);
   }
 
   static bool _compareUint8Lists(Uint8List a, Uint8List b) {
@@ -305,5 +342,6 @@ class _Header {
   final int totalLength;
   final int headerWithoutSigLength;
   final Uint8List? signature;
-  _Header(this.remoteDhPublicKey, this.n, this.pn, this.nonce, this.totalLength, this.signature, this.headerWithoutSigLength);
+  final Uint8List? kemCiphertext;
+  _Header(this.remoteDhPublicKey, this.n, this.pn, this.nonce, this.totalLength, this.signature, this.headerWithoutSigLength, this.kemCiphertext);
 }

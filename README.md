@@ -15,3 +15,13 @@ A few resources to get you started if this is your first Flutter project:
 For help getting started with Flutter development, view the
 [online documentation](https://docs.flutter.dev/), which offers tutorials,
 samples, guidance on mobile development, and a full API reference.
+
+## Testing
+You can run the cryptographic unit tests using:
+```bash
+flutter test test/crypto_test.dart
+```
+These tests verify:
+- Libsodium and LibOQS initialization.
+- X25519 and PQC key generation.
+- The Double Ratchet protocol state machine and message sequence.
