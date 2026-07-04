@@ -2,6 +2,7 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 
 class HKDF {
+  /// Robust HKDF-SHA256 implementation
   static Uint8List compute({
     required Uint8List ikm,
     required Uint8List salt,

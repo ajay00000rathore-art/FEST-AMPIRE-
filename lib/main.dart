@@ -1,121 +1,144 @@
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'crypto/sodium_init.dart';
+import 'crypto/double_ratchet.dart';
+import 'crypto/pqc.dart';
 
 void main() {
-  runApp(const MyApp());
+  runApp(const QuantumShieldApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class QuantumShieldApp extends StatelessWidget {
+  const QuantumShieldApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      title: 'QuantumShield Demo',
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blueGrey, brightness: Brightness.dark),
+        useMaterial3: true,
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const CryptoDemoScreen(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class CryptoDemoScreen extends StatefulWidget {
+  const CryptoDemoScreen({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<CryptoDemoScreen> createState() => _CryptoDemoScreenState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _CryptoDemoScreenState extends State<CryptoDemoScreen> {
+  String _status = 'Idle';
+  String _output = 'Press the button to run a PQ-Double Ratchet handshake demo.';
+  bool _isRunning = false;
 
-  void _incrementCounter() {
+  Future<void> _runDemo() async {
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _isRunning = true;
+      _status = 'Initializing...';
+      _output = '';
     });
+
+    try {
+      final sodium = await MySodiumInit.instance;
+      setState(() => _status = 'Generating Keys...');
+
+      final aliceDh = sodium.crypto.box.keyPair();
+      final bobDh = sodium.crypto.box.keyPair();
+      final sharedRootKey = sodium.randombytes.buf(32);
+
+      setState(() => _status = 'Initializing Ratchet...');
+      final aliceState = await DoubleRatchetService.initializeRatchet(
+        sharedRootKey: sharedRootKey,
+        initialDhKeyPair: aliceDh,
+        remoteDhPublicKey: bobDh.publicKey,
+      );
+
+      final bobState = await DoubleRatchetService.initializeRatchet(
+        sharedRootKey: sharedRootKey,
+        initialDhKeyPair: bobDh,
+        remoteDhPublicKey: aliceDh.publicKey,
+      );
+
+      setState(() => _status = 'Encrypting...');
+      final message = Uint8List.fromList('Post-Quantum Secure Hello!'.codeUnits);
+      final encrypted = await DoubleRatchetService.encrypt(aliceState, message, Uint8List(0));
+
+      setState(() => _status = 'Decrypting...');
+      final decrypted = await DoubleRatchetService.decrypt(bobState, encrypted, Uint8List(0));
+
+      setState(() {
+        _status = 'Success!';
+        _output = 'Handshake Complete.\n\n'
+            'Message: "Post-Quantum Secure Hello!"\n'
+            'Ciphertext Length: ${encrypted.length} bytes\n'
+            'Decrypted: "${String.fromCharCodes(decrypted)}"\n\n'
+            'Double Ratchet state successfully synchronized between Alice and Bob.';
+      });
+    } catch (e) {
+      setState(() {
+        _status = 'Error';
+        _output = 'Failed to run crypto demo: $e\n\n'
+            'Note: This demo requires native libsodium and liboqs binaries to be correctly installed on the host system.';
+      });
+    } finally {
+      setState(() => _isRunning = false);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+        title: const Text('QuantumShield Messenger Demo'),
+        backgroundColor: Theme.of(context).colorScheme.primaryContainer,
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
         child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  children: [
+                    Text('Status: $_status', style: Theme.of(context).textTheme.headlineSmall),
+                    const SizedBox(height: 8),
+                    if (_isRunning) const LinearProgressIndicator(),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Expanded(
+              child: SingleChildScrollView(
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.black26,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    _output,
+                    style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            ElevatedButton.icon(
+              onPressed: _isRunning ? null : _runDemo,
+              icon: const Icon(Icons.security),
+              label: const Text('Run PQ-Ratchet Handshake'),
+              style: ElevatedButton.styleFrom(padding: const EdgeInsets.all(16)),
             ),
           ],
         ),
-      ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
       ),
     );
   }

@@ -18,6 +18,9 @@ class RatchetState {
   MySigKeyPair? localMLDSAKeyPair;
   Uint8List? remoteMLDSAPublicKey;
 
+  // Hybrid shared secrets that will be incorporated into the NEXT DH step
+  Uint8List? pendingPqSecret;
+
   int nSending = 0;
   int nReceiving = 0;
   int pn = 0;
@@ -131,10 +134,13 @@ class DoubleRatchetService {
     final newClassicalBytes = await newDhSecret.extractBytes();
     newDhSecret.dispose();
 
-    // In this step Alice would typically generate a new PQ key and Bob would encapsulate.
-    // For now we maintain the classical structure but show where PQ fits.
-    final newCombinedSecret = Uint8List(newClassicalBytes.length);
+    // Alice would also combine with her generated PQ secret if applicable
+    Uint8List newPqBytes = state.pendingPqSecret ?? Uint8List(0);
+    state.pendingPqSecret = null;
+
+    final newCombinedSecret = Uint8List(newClassicalBytes.length + newPqBytes.length);
     newCombinedSecret.setRange(0, newClassicalBytes.length, newClassicalBytes);
+    newCombinedSecret.setRange(newClassicalBytes.length, newCombinedSecret.length, newPqBytes);
 
     final rootKdfResult2 = await _kdfRoot(sodium, state.rootKey, newCombinedSecret);
     state.rootKey.dispose();
@@ -183,14 +189,13 @@ class DoubleRatchetService {
       key: messageKey,
     );
 
-    // If we have a remote ML-KEM public key, we SHOULD encapsulate here
     Uint8List? kemCiphertext;
     if (state.remoteMLKEMPublicKey != null) {
        final kem = KEM.create('ML-KEM-768')!;
        try {
          final result = kem.encapsulate(state.remoteMLKEMPublicKey!);
          kemCiphertext = result.ciphertext;
-         // result.sharedSecret would be used to update the root key in the NEXT DH ratchet step
+         state.pendingPqSecret = result.sharedSecret; // Store to update root key in next DH step
        } finally {
          kem.dispose();
        }
@@ -217,7 +222,7 @@ class DoubleRatchetService {
 
   static Future<Uint8List> decrypt(RatchetState state, Uint8List ciphertextWithHeader, Uint8List ad) async {
     final sodium = await MySodiumInit.instance as SodiumSumo;
-    final header = _parseHeader(ciphertextWithHeader, state.remoteMLDSAPublicKey != null, true); // true for optional KEM
+    final header = _parseHeader(ciphertextWithHeader, state.remoteMLDSAPublicKey != null, true);
     final ciphertext = ciphertextWithHeader.sublist(header.totalLength);
 
     if (state.remoteMLDSAPublicKey != null) {
@@ -310,7 +315,6 @@ class DoubleRatchetService {
        final isKemPresent = data[offset] == 1;
        offset++;
        if (isKemPresent) {
-          // ML-KEM-768 ciphertext is 1088 bytes
           kemCiphertext = data.sublist(offset, offset + 1088);
           offset += 1088;
        }
