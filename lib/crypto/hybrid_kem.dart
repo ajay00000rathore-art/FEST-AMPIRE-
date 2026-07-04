@@ -10,12 +10,14 @@ class HybridKeyExchange {
     required Uint8List salt,
     required Uint8List info,
   }) async {
+    final sodium = await MySodiumInit.instance;
     final x25519Bytes = await x25519SharedSecret.extractBytes();
     final combinedSecret = Uint8List(x25519Bytes.length + mlKemSharedSecret.length);
     combinedSecret.setRange(0, x25519Bytes.length, x25519Bytes);
     combinedSecret.setRange(x25519Bytes.length, combinedSecret.length, mlKemSharedSecret);
 
-    final result = HKDF.compute(
+    final result = await NativeHKDF.compute(
+      sodium: sodium,
       ikm: combinedSecret,
       salt: salt,
       info: info,

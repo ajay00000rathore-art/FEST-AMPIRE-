@@ -3,7 +3,7 @@ import 'package:oqs/oqs.dart';
 class PQCService {
   static bool _initialized = false;
 
-  static void _ensureInitialized() {
+  static void ensureInitialized() {
     if (!_initialized) {
       try {
         LibOQS.init();
@@ -15,7 +15,7 @@ class PQCService {
   }
 
   static MyKEMKeyPair generateMLKEM768KeyPair() {
-    _ensureInitialized();
+    ensureInitialized();
     final kem = KEM.create('ML-KEM-768');
     if (kem == null) throw PQCException('ML-KEM-768 not supported by liboqs');
     try {
@@ -27,7 +27,7 @@ class PQCService {
   }
 
   static MySigKeyPair generateMLDSA65KeyPair() {
-    _ensureInitialized();
+    ensureInitialized();
     final sig = Signature.create('ML-DSA-65');
     if (sig == null) throw PQCException('ML-DSA-65 not supported by liboqs');
     try {

@@ -17,6 +17,8 @@ dependencies:
   oqs: ^2.4.0
   crypto: ^3.0.7
   flutter_secure_storage: ^10.3.1
+  sqflite_sqlcipher: ^3.4.0
+  sqflite_common_ffi: ^2.4.0+3
 
 dev_dependencies:
   flutter_test:

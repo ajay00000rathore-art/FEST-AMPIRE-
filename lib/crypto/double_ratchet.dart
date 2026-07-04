@@ -1,5 +1,5 @@
+import 'dart:convert';
 import 'dart:typed_data';
-import 'package:sodium/sodium.dart';
 import 'package:sodium/sodium_sumo.dart';
 import 'package:oqs/oqs.dart';
 import 'sodium_init.dart';
@@ -18,7 +18,6 @@ class RatchetState {
   MySigKeyPair? localMLDSAKeyPair;
   Uint8List? remoteMLDSAPublicKey;
 
-  // Hybrid shared secrets that will be incorporated into the NEXT DH step
   Uint8List? pendingPqSecret;
 
   int nSending = 0;
@@ -47,10 +46,47 @@ class RatchetState {
       key.dispose();
     }
   }
+
+  Future<Map<String, dynamic>> toMap() async {
+    return {
+      'rootKey': base64Encode(rootKey.extractBytes()),
+      'sendingChainKey': sendingChainKey != null ? base64Encode(sendingChainKey!.extractBytes()) : null,
+      'receivingChainKey': receivingChainKey != null ? base64Encode(receivingChainKey!.extractBytes()) : null,
+      'dhPublicKey': base64Encode(dhKeyPair.publicKey),
+      'dhSecretKey': base64Encode(dhKeyPair.secretKey.extractBytes()),
+      'remoteDhPublicKey': base64Encode(remoteDhPublicKey),
+      'nSending': nSending,
+      'nReceiving': nReceiving,
+      'pn': pn,
+    };
+  }
+
+  static Future<RatchetState> fromMap(Map<String, dynamic> map, Sodium sodium) async {
+    return RatchetState(
+      rootKey: sodium.secureCopy(base64Decode(map['rootKey'])),
+      sendingChainKey: map['sendingChainKey'] != null ? sodium.secureCopy(base64Decode(map['sendingChainKey'])) : null,
+      receivingChainKey: map['receivingChainKey'] != null ? sodium.secureCopy(base64Decode(map['receivingChainKey'])) : null,
+      dhKeyPair: KeyPair(
+        publicKey: base64Decode(map['dhPublicKey']),
+        secretKey: sodium.secureCopy(base64Decode(map['dhSecretKey'])),
+      ),
+      remoteDhPublicKey: base64Decode(map['remoteDhPublicKey']),
+    )..nSending = map['nSending']
+     ..nReceiving = map['nReceiving']
+     ..pn = map['pn'];
+  }
 }
 
 class DoubleRatchetService {
   static const int maxSkip = 1000;
+
+  static void _ensurePQCInit() {
+    try {
+      PQCService.ensureInitialized();
+    } catch (e) {
+      print('Warning: PQC not available: $e');
+    }
+  }
 
   static Future<RatchetState> initializeRatchet({
     required Uint8List sharedRootKey,
@@ -60,8 +96,9 @@ class DoubleRatchetService {
     Uint8List? remoteMLKEMPublicKey,
   }) async {
     final sodium = await MySodiumInit.instance;
+    _ensurePQCInit();
     return RatchetState(
-      rootKey: await sodium.secureCopy(sharedRootKey),
+      rootKey: sodium.secureCopy(sharedRootKey),
       dhKeyPair: initialDhKeyPair,
       remoteDhPublicKey: remoteDhPublicKey,
       localMLKEMKeyPair: initialMLKEMKeyPair,
@@ -89,34 +126,37 @@ class DoubleRatchetService {
     int pn,
     {Uint8List? remoteMLKEMCiphertext}
   ) async {
+    _ensurePQCInit();
     await _skipMessageKeys(sodium, state, pn);
     state.pn = state.nSending;
     state.nSending = 0;
     state.nReceiving = 0;
     state.remoteDhPublicKey = remoteDhPublicKey;
 
-    // 1. Classical DH
     final dhSecret = sodium.crypto.scalarmult(
       n: state.dhKeyPair.secretKey,
       p: state.remoteDhPublicKey,
     );
-    final classicalBytes = await dhSecret.extractBytes();
-    dhSecret.dispose();
 
-    // 2. PQ Decapsulation
     Uint8List pqBytes = Uint8List(0);
     if (remoteMLKEMCiphertext != null && state.localMLKEMKeyPair != null) {
-      final kem = KEM.create('ML-KEM-768')!;
       try {
-        pqBytes = kem.decapsulate(remoteMLKEMCiphertext, Uint8List.fromList(state.localMLKEMKeyPair!.secretKey));
-      } finally {
-        kem.dispose();
+        final kem = KEM.create('ML-KEM-768')!;
+        try {
+          pqBytes = kem.decapsulate(remoteMLKEMCiphertext, Uint8List.fromList(state.localMLKEMKeyPair!.secretKey));
+        } finally {
+          kem.dispose();
+        }
+      } catch (e) {
+        print('Warning: PQC decapsulation skipped/failed: $e');
       }
     }
 
+    final classicalBytes = dhSecret.extractBytes();
     final combinedSecret = Uint8List(classicalBytes.length + pqBytes.length);
     combinedSecret.setRange(0, classicalBytes.length, classicalBytes);
     combinedSecret.setRange(classicalBytes.length, combinedSecret.length, pqBytes);
+    dhSecret.dispose();
 
     final rootKdfResult = await _kdfRoot(sodium, state.rootKey, combinedSecret);
     state.rootKey.dispose();
@@ -131,10 +171,9 @@ class DoubleRatchetService {
       n: state.dhKeyPair.secretKey,
       p: state.remoteDhPublicKey,
     );
-    final newClassicalBytes = await newDhSecret.extractBytes();
+    final newClassicalBytes = newDhSecret.extractBytes();
     newDhSecret.dispose();
 
-    // Alice would also combine with her generated PQ secret if applicable
     Uint8List newPqBytes = state.pendingPqSecret ?? Uint8List(0);
     state.pendingPqSecret = null;
 
@@ -150,25 +189,31 @@ class DoubleRatchetService {
   }
 
   static Future<List<SecureKey>> _kdfRoot(Sodium sodium, SecureKey rootKey, Uint8List ikm) async {
-    final rootKeyBytes = await rootKey.extractBytes();
-    final prk = HKDF.compute(ikm: ikm, salt: rootKeyBytes, info: Uint8List.fromList('DoubleRatchetRoot'.codeUnits), length: 64);
-    final rk = await sodium.secureCopy(prk.sublist(0, 32));
-    final ck = await sodium.secureCopy(prk.sublist(32, 64));
-    return [rk, ck];
+    return await NativeHKDF.deriveKeys(
+      sodium: sodium,
+      masterKey: rootKey,
+      ikm: ikm,
+      info: Uint8List.fromList('DoubleRatchetRoot'.codeUnits),
+      outLengths: [32, 32],
+    );
   }
 
   static Future<List<SecureKey>> _kdfChain(Sodium sodium, SecureKey chainKey) async {
-    final chainKeyBytes = await chainKey.extractBytes();
-    final mk = HKDF.compute(ikm: Uint8List.fromList([0x01]), salt: chainKeyBytes, info: Uint8List.fromList('DoubleRatchetMessage'.codeUnits), length: 32);
-    final nextCk = HKDF.compute(ikm: Uint8List.fromList([0x02]), salt: chainKeyBytes, info: Uint8List.fromList('DoubleRatchetChain'.codeUnits), length: 32);
-    return [await sodium.secureCopy(nextCk), await sodium.secureCopy(mk)];
+    return await NativeHKDF.deriveKeys(
+      sodium: sodium,
+      masterKey: chainKey,
+      ikm: Uint8List.fromList([0x01]),
+      info: Uint8List.fromList('DoubleRatchetChain'.codeUnits),
+      outLengths: [32, 32],
+    );
   }
 
   static Future<Uint8List> encrypt(RatchetState state, Uint8List plaintext, Uint8List ad) async {
     final sodium = await MySodiumInit.instance as SodiumSumo;
+    _ensurePQCInit();
     if (state.sendingChainKey == null) {
        final dhSecret = sodium.crypto.scalarmult(n: state.dhKeyPair.secretKey, p: state.remoteDhPublicKey);
-       final dhBytes = await dhSecret.extractBytes();
+       final dhBytes = dhSecret.extractBytes();
        final res = await _kdfRoot(sodium, state.rootKey, dhBytes);
        state.rootKey.dispose();
        state.rootKey = res[0];
@@ -191,25 +236,33 @@ class DoubleRatchetService {
 
     Uint8List? kemCiphertext;
     if (state.remoteMLKEMPublicKey != null) {
-       final kem = KEM.create('ML-KEM-768')!;
        try {
-         final result = kem.encapsulate(state.remoteMLKEMPublicKey!);
-         kemCiphertext = result.ciphertext;
-         state.pendingPqSecret = result.sharedSecret; // Store to update root key in next DH step
-       } finally {
-         kem.dispose();
+         final kem = KEM.create('ML-KEM-768')!;
+         try {
+           final result = kem.encapsulate(state.remoteMLKEMPublicKey!);
+           kemCiphertext = result.ciphertext;
+           state.pendingPqSecret = result.sharedSecret;
+         } finally {
+           kem.dispose();
+         }
+       } catch (e) {
+         print('Warning: PQC encapsulation skipped/failed: $e');
        }
     }
 
     var header = _buildHeader(state.dhKeyPair.publicKey, state.nSending, state.pn, nonce, kemCiphertext);
 
     if (state.localMLDSAKeyPair != null) {
-       final sig = Signature.create('ML-DSA-65')!;
        try {
-         final signature = sig.sign(Uint8List.fromList([...header, ...ciphertext]), Uint8List.fromList(state.localMLDSAKeyPair!.secretKey));
-         header = Uint8List.fromList([...header, ...signature]);
-       } finally {
-         sig.dispose();
+         final sig = Signature.create('ML-DSA-65')!;
+         try {
+           final signature = sig.sign(Uint8List.fromList([...header, ...ciphertext]), Uint8List.fromList(state.localMLDSAKeyPair!.secretKey));
+           header = Uint8List.fromList([...header, ...signature]);
+         } finally {
+           sig.dispose();
+         }
+       } catch (e) {
+         print('Signature failed: $e');
        }
     } else if (state.remoteMLDSAPublicKey != null) {
        throw Exception('Authentication failure: Local ML-DSA key missing but remote expects signed messages');
@@ -222,19 +275,25 @@ class DoubleRatchetService {
 
   static Future<Uint8List> decrypt(RatchetState state, Uint8List ciphertextWithHeader, Uint8List ad) async {
     final sodium = await MySodiumInit.instance as SodiumSumo;
+    _ensurePQCInit();
     final header = _parseHeader(ciphertextWithHeader, state.remoteMLDSAPublicKey != null, true);
     final ciphertext = ciphertextWithHeader.sublist(header.totalLength);
 
     if (state.remoteMLDSAPublicKey != null) {
       if (header.signature == null) throw Exception('Authentication failure: Missing required ML-DSA signature');
-      final sig = Signature.create('ML-DSA-65')!;
       try {
-        final actualSignedData = Uint8List.fromList([...ciphertextWithHeader.sublist(0, header.headerWithoutSigLength), ...ciphertext]);
-        if (!sig.verify(actualSignedData, header.signature!, state.remoteMLDSAPublicKey!)) {
-          throw Exception('ML-DSA Signature verification failed');
+        final sig = Signature.create('ML-DSA-65')!;
+        try {
+          final actualSignedData = Uint8List.fromList([...ciphertextWithHeader.sublist(0, header.headerWithoutSigLength), ...ciphertext]);
+          if (!sig.verify(actualSignedData, header.signature!, state.remoteMLDSAPublicKey!)) {
+            throw Exception('ML-DSA Signature verification failed');
+          }
+        } finally {
+          sig.dispose();
         }
-      } finally {
-        sig.dispose();
+      } catch (e) {
+        if (e is! Exception) throw Exception('PQC Signature verification failed (native error): $e');
+        rethrow;
       }
     }
 
@@ -294,15 +353,16 @@ class DoubleRatchetService {
     b.add(data.buffer.asUint8List());
     b.add(nonce);
     if (kemCiphertext != null) {
-       b.addByte(1); // KEM present
+       b.addByte(1);
        b.add(kemCiphertext);
     } else {
-       b.addByte(0); // No KEM
+       b.addByte(0);
     }
     return b.toBytes();
   }
 
   static _Header _parseHeader(Uint8List data, bool expectSignature, bool hasKemFlag) {
+    if (data.length < 40 + 24) throw Exception('Header too short');
     final dhPk = data.sublist(0, 32);
     final bd = ByteData.view(data.buffer, data.offsetInBytes + 32, 8);
     final n = bd.getUint32(0);
@@ -312,9 +372,11 @@ class DoubleRatchetService {
 
     Uint8List? kemCiphertext;
     if (hasKemFlag) {
+       if (data.length <= offset) throw Exception('Missing KEM flag');
        final isKemPresent = data[offset] == 1;
        offset++;
        if (isKemPresent) {
+          if (data.length < offset + 1088) throw Exception('Header too short for ML-KEM-768 ciphertext');
           kemCiphertext = data.sublist(offset, offset + 1088);
           offset += 1088;
        }
@@ -323,6 +385,7 @@ class DoubleRatchetService {
     final int headerWithoutSigLength = offset;
     Uint8List? signature;
     if (expectSignature) {
+       if (data.length < offset + 3309) throw Exception('Header too short for ML-DSA-65 signature');
        signature = data.sublist(offset, offset + 3309);
        offset += 3309;
     }
